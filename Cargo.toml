@@ -1,0 +1,8 @@
+[package]
+name = "vm_settings"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+windows = { version = "0.42", features = ["Win32_Foundation","Win32_System_Com","Win32_System_Ole","Win32_System_Wmi","Win32_System_Rpc","Win32_Security"] }
