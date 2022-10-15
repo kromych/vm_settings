@@ -135,6 +135,7 @@ struct HyperVVmSettings {
     pub virtual_system_sub_type: Option<String>,
     pub secure_boot_enabled: Option<String>,
     pub turn_off_on_guest_restart: Option<String>,
+    pub version: Option<String>,
 }
 
 impl WmiRowConstructable<HyperVVmSettings> for HyperVVmSettings {
@@ -153,6 +154,7 @@ impl WmiRowConstructable<HyperVVmSettings> for HyperVVmSettings {
             virtual_system_sub_type: get_row_item(row, "VirtualSystemSubType")?,
             secure_boot_enabled: get_row_item(row, "SecureBootEnabled")?,
             turn_off_on_guest_restart: get_row_item(row, "TurnOffOnGuestRestart")?,
+            version: get_row_item(row, "Version")?,
         })
     }
 
