@@ -1,6 +1,6 @@
 use anyhow::Result;
 use windows::core::BSTR;
-use windows::w;
+use windows::core::PCWSTR;
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::System::Com::CoCreateInstance;
 use windows::Win32::System::Com::CoInitializeEx;
@@ -10,18 +10,83 @@ use windows::Win32::System::Com::COINIT_MULTITHREADED;
 use windows::Win32::System::Com::EOAC_NONE;
 use windows::Win32::System::Com::RPC_C_AUTHN_LEVEL_DEFAULT;
 use windows::Win32::System::Com::RPC_C_IMP_LEVEL_IMPERSONATE;
+use windows::Win32::System::Com::VARIANT;
 use windows::Win32::System::Ole::VarFormat;
 use windows::Win32::System::Ole::VariantClear;
 use windows::Win32::System::Ole::VARFORMAT_FIRST_DAY_SYSTEMDEFAULT;
 use windows::Win32::System::Ole::VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT;
+use windows::Win32::System::Wmi::IWbemClassObject;
 use windows::Win32::System::Wmi::IWbemLocator;
 use windows::Win32::System::Wmi::IWbemServices;
 use windows::Win32::System::Wmi::WbemLocator;
 use windows::Win32::System::Wmi::WBEM_FLAG_FORWARD_ONLY;
 use windows::Win32::System::Wmi::WBEM_FLAG_RETURN_IMMEDIATELY;
 
-const VM_SETTINGS_QUERY: &str = "SELECT * FROM Msvm_VirtualSystemSettingData";
-const VM_STATUS_QUERY: &str = "SELECT * FROM Msvm_ComputerSystem";
+fn init_com() -> Result<()> {
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED)?;
+        CoInitializeSecurity(
+            PSECURITY_DESCRIPTOR::default(),
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            None,
+            EOAC_NONE,
+            None,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn connect_hyperv_wmi() -> Result<IWbemServices> {
+    let server = unsafe {
+        let locator: IWbemLocator = CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)?;
+        locator.ConnectServer(
+            &BSTR::from("root\\virtualization\\v2"),
+            &BSTR::new(),
+            &BSTR::new(),
+            &BSTR::new(),
+            0,
+            &BSTR::new(),
+            None,
+        )?
+    };
+
+    Ok(server)
+}
+
+fn get_row_item(o: &IWbemClassObject, name: &str) -> Result<String> {
+    let mut value: VARIANT = Default::default();
+    let wide_name = name.encode_utf16().collect::<Vec<_>>().as_ptr();
+    unsafe {
+        o.Get(
+            PCWSTR(wide_name),
+            0,
+            &mut value,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )?;
+
+        let bstr = VarFormat(
+            &value,
+            None,
+            VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
+            VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
+            0,
+        )?;
+
+        VariantClear(&mut value)?;
+        Ok(String::from_utf16(bstr.as_wide())?)
+    }
+}
+
+trait WmiRowConstructable<T> {
+    fn from_row(row: &IWbemClassObject) -> Result<T>;
+    fn query_one(key: &str) -> String;
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -39,6 +104,34 @@ struct HyperVVmSettings {
     virtual_system_sub_type: String,
     secure_boot_enabled: String,
     turn_off_on_guest_restart: String,
+}
+
+impl WmiRowConstructable<HyperVVmSettings> for HyperVVmSettings {
+    fn from_row(row: &IWbemClassObject) -> Result<HyperVVmSettings> {
+        Ok(HyperVVmSettings {
+            virtual_system_identifier: get_row_item(row, "VirtualSystemIdentifier")
+                .unwrap_or_default(),
+            configuration_data_root: get_row_item(row, "ConfigurationDataRoot").unwrap_or_default(),
+            configuration_file: get_row_item(row, "ConfigurationFile").unwrap_or_default(),
+            firmware_file: get_row_item(row, "FirmwareFile").unwrap_or_default(),
+            firmware_parameters: get_row_item(row, "FirmwareParameters").unwrap_or_default(),
+            guest_state_data_root: get_row_item(row, "GuestStateDataRoot").unwrap_or_default(),
+            guest_state_file: get_row_item(row, "GuestStateFile").unwrap_or_default(),
+            guest_state_isolation_enabled: get_row_item(row, "GuestStateIsolationEnabled")
+                .unwrap_or_default(),
+            guest_state_isolation_type: get_row_item(row, "GuestStateIsolationType")
+                .unwrap_or_default(),
+            is_saved: get_row_item(row, "IsSaved").unwrap_or_default(),
+            virtual_system_sub_type: get_row_item(row, "VirtualSystemSubType").unwrap_or_default(),
+            secure_boot_enabled: get_row_item(row, "SecureBootEnabled").unwrap_or_default(),
+            turn_off_on_guest_restart: get_row_item(row, "TurnOffOnGuestRestart")
+                .unwrap_or_default(),
+        })
+    }
+
+    fn query_one(key: &str) -> String {
+        format!("SELECT * FROM Msvm_VirtualSystemSettingData WHERE ElementName='{key}'")
+    }
 }
 
 #[derive(Debug)]
@@ -92,45 +185,83 @@ struct HyperVVmStatus {
     transitioning_to_state: String,
 }
 
-fn init_com() -> Result<()> {
-    unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED)?;
-        CoInitializeSecurity(
-            PSECURITY_DESCRIPTOR::default(),
-            -1,
-            None,
-            None,
-            RPC_C_AUTHN_LEVEL_DEFAULT,
-            RPC_C_IMP_LEVEL_IMPERSONATE,
-            None,
-            EOAC_NONE,
-            None,
-        )?;
+impl WmiRowConstructable<HyperVVmStatus> for HyperVVmStatus {
+    fn from_row(row: &IWbemClassObject) -> Result<HyperVVmStatus> {
+        Ok(HyperVVmStatus {
+            available_requested_states: get_row_item(row, "AvailableRequestedStates")
+                .unwrap_or_default(),
+            caption: get_row_item(row, "Caption").unwrap_or_default(),
+            communication_status: get_row_item(row, "CommunicationStatus").unwrap_or_default(),
+            creation_class_name: get_row_item(row, "CreationClassName").unwrap_or_default(),
+            dedicated: get_row_item(row, "Dedicated").unwrap_or_default(),
+            description: get_row_item(row, "Description").unwrap_or_default(),
+            detailed_status: get_row_item(row, "DetailedStatus").unwrap_or_default(),
+            element_name: get_row_item(row, "ElementName").unwrap_or_default(),
+            enabled_default: get_row_item(row, "EnabledDefault").unwrap_or_default(),
+            enabled_state: get_row_item(row, "EnabledState").unwrap_or_default(),
+            enhanced_session_mode_state: get_row_item(row, "EnhancedSessionModeState")
+                .unwrap_or_default(),
+            failed_over_replication_type: get_row_item(row, "FailedOverReplicationType")
+                .unwrap_or_default(),
+            health_state: get_row_item(row, "HealthState").unwrap_or_default(),
+            hw_threads_per_core_realized: get_row_item(row, "HwThreadsPerCoreRealized")
+                .unwrap_or_default(),
+            identifying_descriptions: get_row_item(row, "IdentifyingDescriptions")
+                .unwrap_or_default(),
+            install_date: get_row_item(row, "InstallDate").unwrap_or_default(),
+            instance_id: get_row_item(row, "InstanceID").unwrap_or_default(),
+            last_application_consistent_replication_time: get_row_item(
+                row,
+                "LastApplicationConsistentReplicationTime",
+            )
+            .unwrap_or_default(),
+            last_replication_time: get_row_item(row, "LastReplicationTime").unwrap_or_default(),
+            last_replication_type: get_row_item(row, "LastReplicationType").unwrap_or_default(),
+            last_successful_backup_time: get_row_item(row, "LastSuccessfulBackupTime")
+                .unwrap_or_default(),
+            name: get_row_item(row, "Name").unwrap_or_default(),
+            name_format: get_row_item(row, "NameFormat").unwrap_or_default(),
+            number_of_numa_nodes: get_row_item(row, "NumberOfNumaNodes").unwrap_or_default(),
+            on_time_in_milliseconds: get_row_item(row, "OnTimeInMilliseconds").unwrap_or_default(),
+            operating_status: get_row_item(row, "OperatingStatus").unwrap_or_default(),
+            operational_status: get_row_item(row, "OperationalStatus").unwrap_or_default(),
+            other_dedicated_descriptions: get_row_item(row, "OtherDedicatedDescriptions")
+                .unwrap_or_default(),
+            other_enabled_state: get_row_item(row, "OtherEnabledState").unwrap_or_default(),
+            other_identifying_info: get_row_item(row, "OtherIdentifyingInfo").unwrap_or_default(),
+            power_management_capabilities: get_row_item(row, "PowerManagementCapabilities")
+                .unwrap_or_default(),
+            primary_owner_contact: get_row_item(row, "PrimaryOwnerContact").unwrap_or_default(),
+            primary_owner_name: get_row_item(row, "PrimaryOwnerName").unwrap_or_default(),
+            primary_status: get_row_item(row, "PrimaryStatus").unwrap_or_default(),
+            process_id: get_row_item(row, "ProcessID").unwrap_or_default(),
+            replication_health: get_row_item(row, "ReplicationHealth").unwrap_or_default(),
+            replication_mode: get_row_item(row, "ReplicationMode").unwrap_or_default(),
+            replication_state: get_row_item(row, "ReplicationState").unwrap_or_default(),
+            requested_state: get_row_item(row, "RequestedState").unwrap_or_default(),
+            reset_capability: get_row_item(row, "ResetCapability").unwrap_or_default(),
+            roles: get_row_item(row, "Roles").unwrap_or_default(),
+            status: get_row_item(row, "Status").unwrap_or_default(),
+            status_descriptions: get_row_item(row, "StatusDescriptions").unwrap_or_default(),
+            time_of_last_configuration_change: get_row_item(row, "TimeOfLastConfigurationChange")
+                .unwrap_or_default(),
+            time_of_last_state_change: get_row_item(row, "TimeOfLastStateChange")
+                .unwrap_or_default(),
+            transitioning_to_state: get_row_item(row, "TransitioningToState").unwrap_or_default(),
+        })
     }
 
-    Ok(())
+    fn query_one(key: &str) -> String {
+        format!("SELECT * FROM Msvm_ComputerSystem WHERE ElementName='{key}'")
+    }
 }
 
-fn connect_hyperv_wmi() -> Result<IWbemServices> {
-    let server = unsafe {
-        let locator: IWbemLocator = CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)?;
-        locator.ConnectServer(
-            &BSTR::from("root\\virtualization\\v2"),
-            &BSTR::new(),
-            &BSTR::new(),
-            &BSTR::new(),
-            0,
-            &BSTR::new(),
-            None,
-        )?
-    };
-
-    Ok(server)
-}
-
-fn get_hyperv_vm_settings(server: &IWbemServices, vm_name: &str) -> Result<HyperVVmSettings> {
+fn query_one<T>(server: &IWbemServices, vm_name: &str) -> Result<T>
+where
+    T: WmiRowConstructable<T>,
+{
     unsafe {
-        let query = format!("{VM_SETTINGS_QUERY} WHERE ElementName='{}'", vm_name);
+        let query = T::query_one(vm_name);
         let query = server.ExecQuery(
             &BSTR::from("WQL"),
             &BSTR::from(query),
@@ -143,314 +274,21 @@ fn get_hyperv_vm_settings(server: &IWbemServices, vm_name: &str) -> Result<Hyper
 
         query.Next(-1, &mut row, &mut returned).ok()?;
         if let Some(row) = &row[0] {
-            let mut virtual_system_identifier_var = Default::default();
-            let mut configuration_data_root_var = Default::default();
-            let mut configuration_file_var = Default::default();
-            let mut firmware_file_var = Default::default();
-            let mut firmware_parameters_var = Default::default();
-            let mut guest_state_data_root_var = Default::default();
-            let mut guest_state_file_var = Default::default();
-            let mut guest_state_isolation_enabled_var = Default::default();
-            let mut guest_state_isolation_type_var = Default::default();
-            let mut is_saved_var = Default::default();
-            let mut virtual_system_sub_type_var = Default::default();
-            let mut secure_boot_enabled_var = Default::default();
-            let mut turn_off_on_guest_restart_var = Default::default();
-
-            row.Get(
-                w!("VirtualSystemIdentifier"),
-                0,
-                &mut virtual_system_identifier_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("ConfigurationDataRoot"),
-                0,
-                &mut configuration_data_root_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("ConfigurationFile"),
-                0,
-                &mut configuration_file_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("FirmwareFile"),
-                0,
-                &mut firmware_file_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("FirmwareParameters"),
-                0,
-                &mut firmware_parameters_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("GuestStateDataRoot"),
-                0,
-                &mut guest_state_data_root_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("GuestStateFile"),
-                0,
-                &mut guest_state_file_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("GuestStateIsolationEnabled"),
-                0,
-                &mut guest_state_isolation_enabled_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("GuestStateIsolationType"),
-                0,
-                &mut guest_state_isolation_type_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("IsSaved"),
-                0,
-                &mut is_saved_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("VirtualSystemSubType"),
-                0,
-                &mut virtual_system_sub_type_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("SecureBootEnabled"),
-                0,
-                &mut secure_boot_enabled_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-            row.Get(
-                w!("TurnOffOnGuestRestart"),
-                0,
-                &mut turn_off_on_guest_restart_var,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )?;
-
-            let virtual_system_identifier = VarFormat(
-                &virtual_system_identifier_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let configuration_data_root = VarFormat(
-                &configuration_data_root_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let configuration_file = VarFormat(
-                &configuration_file_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let firmware_file = VarFormat(
-                &firmware_file_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let firmware_parameters = VarFormat(
-                &firmware_parameters_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let guest_state_data_root = VarFormat(
-                &guest_state_data_root_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let guest_state_file = VarFormat(
-                &guest_state_file_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let guest_state_isolation_enabled = VarFormat(
-                &guest_state_isolation_enabled_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let guest_state_isolation_type = VarFormat(
-                &guest_state_isolation_type_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let is_saved = VarFormat(
-                &is_saved_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let virtual_system_sub_type = VarFormat(
-                &virtual_system_sub_type_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let secure_boot_enabled = VarFormat(
-                &secure_boot_enabled_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-            let turn_off_on_guest_restart = VarFormat(
-                &turn_off_on_guest_restart_var,
-                None,
-                VARFORMAT_FIRST_DAY_SYSTEMDEFAULT,
-                VARFORMAT_FIRST_WEEK_SYSTEMDEFAULT,
-                0,
-            )?;
-
-            VariantClear(&mut virtual_system_identifier_var)?;
-            VariantClear(&mut configuration_data_root_var)?;
-            VariantClear(&mut configuration_file_var)?;
-            VariantClear(&mut firmware_file_var)?;
-            VariantClear(&mut firmware_parameters_var)?;
-            VariantClear(&mut guest_state_data_root_var)?;
-            VariantClear(&mut guest_state_file_var)?;
-            VariantClear(&mut guest_state_isolation_enabled_var)?;
-            VariantClear(&mut guest_state_isolation_type_var)?;
-            VariantClear(&mut is_saved_var)?;
-            VariantClear(&mut virtual_system_sub_type_var)?;
-            VariantClear(&mut secure_boot_enabled_var)?;
-            VariantClear(&mut turn_off_on_guest_restart_var)?;
-
-            let virtual_system_identifier =
-                String::from_utf16(virtual_system_identifier.as_wide())?;
-            let configuration_data_root = String::from_utf16(configuration_data_root.as_wide())?;
-            let configuration_file = String::from_utf16(configuration_file.as_wide())?;
-            let firmware_file = String::from_utf16(firmware_file.as_wide())?;
-            let firmware_parameters = String::from_utf16(firmware_parameters.as_wide())?;
-            let guest_state_data_root = String::from_utf16(guest_state_data_root.as_wide())?;
-            let guest_state_file = String::from_utf16(guest_state_file.as_wide())?;
-            let guest_state_isolation_enabled =
-                String::from_utf16(guest_state_isolation_enabled.as_wide())?;
-            let guest_state_isolation_type =
-                String::from_utf16(guest_state_isolation_type.as_wide())?;
-            let is_saved = String::from_utf16(is_saved.as_wide())?;
-            let virtual_system_sub_type = String::from_utf16(virtual_system_sub_type.as_wide())?;
-            let secure_boot_enabled = String::from_utf16(secure_boot_enabled.as_wide())?;
-            let turn_off_on_guest_restart =
-                String::from_utf16(turn_off_on_guest_restart.as_wide())?;
-
-            Ok(HyperVVmSettings {
-                virtual_system_identifier,
-                configuration_data_root,
-                configuration_file,
-                firmware_file,
-                firmware_parameters,
-                guest_state_data_root,
-                guest_state_file,
-                guest_state_isolation_enabled,
-                guest_state_isolation_type,
-                is_saved,
-                virtual_system_sub_type,
-                secure_boot_enabled,
-                turn_off_on_guest_restart,
-            })
+            Ok(T::from_row(row)?)
         } else {
             anyhow::bail!("Not found")
         }
     }
 }
 
-/*
-fn get_hyperv_vm_status() -> Result<HyperVVmStatus> {
-    // AvailableRequestedStates
-    // Caption
-    // CommunicationStatus
-    // CreationClassName
-    // Dedicated
-    // Description
-    // DetailedStatus
-    // ElementName
-    // EnabledDefault
-    // EnabledState
-    // EnhancedSessionModeState
-    // FailedOverReplicationType
-    // HealthState
-    // HwThreadsPerCoreRealized
-    // IdentifyingDescriptions
-    // InstallDate
-    // InstanceID
-    // LastApplicationConsistentReplicationTime
-    // LastReplicationTime
-    // LastReplicationType
-    // LastSuccessfulBackupTime
-    // Name
-    // NameFormat
-    // NumberOfNumaNodes
-    // OnTimeInMilliseconds
-    // OperatingStatus
-    // OperationalStatus
-    // OtherDedicatedDescriptions
-    // OtherEnabledState
-    // OtherIdentifyingInfo
-    // PowerManagementCapabilities
-    // PrimaryOwnerContact
-    // PrimaryOwnerName
-    // PrimaryStatus
-    // ProcessID
-    // ReplicationHealth
-    // ReplicationMode
-    // ReplicationState
-    // RequestedState
-    // ResetCapability
-    // Roles
-    // Status
-    // StatusDescriptions
-    // TimeOfLastConfigurationChange
-    // TimeOfLastStateChange
-    // TransitioningToState
-}
-*/
-
 fn main() -> Result<()> {
     init_com()?;
 
     let server = connect_hyperv_wmi()?;
-    let settings = get_hyperv_vm_settings(&server, "alpine")?;
+    let status = query_one::<HyperVVmStatus>(&server, "alpine")?;
+    println!("{status:#?}");
 
+    let settings = query_one::<HyperVVmSettings>(&server, "alpine")?;
     println!("{settings:#?}");
 
     Ok(())

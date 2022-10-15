@@ -1,6 +1,7 @@
 .vscode
 .vs
 .windows
+.idea
 target
 packages
 obj
